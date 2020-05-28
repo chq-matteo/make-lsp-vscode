@@ -15,7 +15,16 @@ import {
 	CompletionItem,
 	TextDocumentPositionParams,
 	TextDocumentSyncKind,
-	MarkupKind
+	MarkupKind,
+	DocumentSymbolParams,
+	ReferenceParams,
+	SymbolInformation,
+	DocumentSymbol,
+	Position,
+	Range,
+	Location,
+	VersionedTextDocumentIdentifier,
+	SymbolKind
 } from 'vscode-languageserver';
 
 import URI from 'vscode-uri';
@@ -27,13 +36,14 @@ let connection = createConnection(ProposedFeatures.all);
 // Create a simple text document manager. The text document manager
 // supports full document sync only
 let documents: TextDocuments = new TextDocuments();
-let symMap: Map<string, Map<string, string> > = new Map();
+let symMap: Map<string, DocumentSymbol[]> = new Map();
 
 
 let hasConfigurationCapability: boolean = false;
 let hasWorkspaceFolderCapability: boolean = false;
 
 connection.onInitialize((params: InitializeParams) => {
+	console.log('starting make lsp');
 	let capabilities = params.capabilities;
 
 	// Does the client support the `workspace/configuration` request?
@@ -44,7 +54,9 @@ connection.onInitialize((params: InitializeParams) => {
 	return {
 		capabilities: {
 			textDocumentSync: TextDocumentSyncKind.Full,
-			hoverProvider: true,
+			documentSymbolProvider: true,
+			referencesProvider: true,
+			definitionProvider: true,
 			completionProvider: {
 				resolveProvider: true,
 				triggerCharacters: ['$']
@@ -66,81 +78,102 @@ connection.onInitialized(() => {
 });
 
 documents.onDidChangeContent(async change => {
-	symMap.delete(change.document.uri);
-	let path = require('path');
-	let dir = path.dirname(URI.parse(change.document.uri).fsPath);
-	const { exec } = require('child_process');
-	await new Promise(r => setTimeout(r, 1000));
-	exec(`make --directory=${dir} -p -n`, async (_error: Error, _stdout: string) => {
-		connection.console.log(`Parsing symbols for ${change.document.uri}`);
-		symMap.set(change.document.uri, await parseSymbols(_stdout));
-	});
-
+	// symMap.delete(change.document.uri);
+	let document = documents.get(change.document.uri);
+	if (!document) return;
+	let symbols = [];
+	let search_pattern = /^([^#\s]*?)(:\s)(.*?)$/m;
+	let dependency_pattern = /([^\s]+)/g;
+	for (let i = 0; i < document.lineCount; i++) {
+		dependency_pattern.lastIndex = 0;
+		search_pattern.lastIndex = 0;
+		dependency_pattern.lastIndex = 0;
+		let line = document.getText(Range.create(Position.create(i, 0), Position.create(i+1, 0)));
+		// console.log(line)
+		let match = search_pattern.exec(line);
+		if (match) {
+			console.log(match)
+			let principal = match[1].trim();
+			let dependencies = match[3].trim();
+			let start = match.index;
+			let end = start + principal.length;
+			let symbol = new DocumentSymbol();
+			symbol.name = principal;
+			symbol.kind = SymbolKind.Function;
+			symbol.range = Range.create(Position.create(i, start), Position.create(i, end));
+			symbol.children = [];
+			symbol.selectionRange = symbol.range;
+			symbols.push(symbol);
+			let dependency_match = dependency_pattern.exec(dependencies);
+			let dependency_start = match.index + match[1].length + match[2].length;
+			while (dependency_match) {
+				let dependency_symbol = new DocumentSymbol();
+				dependency_symbol.name = dependency_match[0].trim();
+				dependency_symbol.kind = SymbolKind.Function;
+				dependency_symbol.range = Range.create(Position.create(i, dependency_start + dependency_match.index), Position.create(i, dependency_start + dependency_match.index + dependency_symbol.name.length));
+				dependency_symbol.selectionRange = dependency_symbol.range;
+				symbol.children.push(dependency_symbol);
+				dependency_match = dependency_pattern.exec(dependencies);
+			}
+		}
+	}
+	symMap.set(change.document.uri, symbols);
 });
 
-async function parseSymbols(_data: string) {
-	let syms: Map<string, string> = new Map();
-	let search_pattern = /^([^#]*?)(:=|=)(.*?)$/gm;
-	let match = search_pattern.exec(_data);
-	let num_match = 0;
-	while(match) {
-		num_match++;
-		syms.set(match[1].trim(), match[3].trim()); 
-		match = search_pattern.exec(_data);
+function inside(range: { start: Position, end: Position }, position: Position) {
+	return (range.start.line < position.line || (range.start.line == position.line && range.start.character < position.character) && (range.end.line > position.line || (range.end.line == position.line && range.end.character > position.character)));
+}
+connection.onReferences(async (params: ReferenceParams) => {
+	console.log('I need references');
+	let syms = symMap.get(params.textDocument.uri);
+	if (!syms) return [];
+	for (let sym of syms) {
+		if (sym.range.start.line === params.position.line) {
+			if (!sym.children) return [];
+			for (let child of sym.children) {
+				if (inside(child.range, params.position)) {
+					for (let parent of syms) {
+						if (parent.name == child.name) {
+							console.log(parent);
+							return [Location.create(params.textDocument.uri, parent.range)];
+						}
+					}
+				}
+			}
+		}
 	}
+	return [];
+});
+connection.onDefinition(async (params: TextDocumentPositionParams) => {
+	console.log('I need references');
+	let syms = symMap.get(params.textDocument.uri);
+	if (!syms) return [];
+	for (let sym of syms) {
+		if (sym.range.start.line === params.position.line) {
+			if (!sym.children) return [];
+			for (let child of sym.children) {
+				if (inside(child.range, params.position)) {
+					for (let parent of syms) {
+						if (parent.name == child.name) {
+							console.log(parent);
+							return [Location.create(params.textDocument.uri, parent.range)];
+						}
+					}
+				}
+			}
+		}
+	}
+	return [];
+});
 
-	connection.console.log(`Found ${num_match} total matches.`);
+connection.onDocumentSymbol(async (params: DocumentSymbolParams) => {
+	console.log('I need symbols');
 
+	let syms = symMap.get(params.textDocument.uri);
+	console.log(syms);
 	return syms;
-}
-
-connection.onHover(async (_params: TextDocumentPositionParams) => {
-	let doc = documents.get(_params.textDocument.uri);
-	if(!doc) { return { contents : [] }; }
-
-	let line = doc.getText().split('\n')[_params.position.line];
-	//let line = text.getText().split('\n')[_params.position.line];
-	connection.console.log(`Hovering on (${_params.position.line}, ${_params.position.character}): ${line}`);
-
-	let phrase = getWordAt(line, _params.position.character);
-	connection.console.log(`Extracted: [${phrase}]`);
-
-	let syms = symMap.get(_params.textDocument.uri);
-	if(!syms) {
-		await new Promise(r => setTimeout(r, 1000));
-		syms = symMap.get(_params.textDocument.uri);
-		if(!syms) { return { contents : [] }; }
-	}
-
-	let def = syms.get(phrase);
-
-	if(!def) { 
-		return { contents : [] }; }
-	else {
-		return { contents: {
-			kind: MarkupKind.Markdown,
-			value: [
-				'```makefile',
-				def,
-				'```'
-			].join('\n')
-		}}
-	}
 });
 
-function getWordAt (_str: string, _pos: number) {
-
-    // Search for the word's beginning and end.
-    var left = _str.slice(0, _pos + 1).search(/[^\s=:\(]+$/),
-        right = _str.slice(_pos).search(/[\s=:\)]/);
-
-    // The last word in the string is a special case.
-    if (right < 0) { return _str.slice(left); }
-
-    // Return the word, using the located bounds to extract it from the string.
-    return _str.slice(left, right + _pos);
-
-}
 // This handler provides the initial list of the completion items.
 connection.onCompletion((_completionInfo: CompletionParams): CompletionItem[] => {
 
